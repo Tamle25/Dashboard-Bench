@@ -16,6 +16,10 @@ if "--version" in sys.argv:
     print("0.0.0-fake")
     sys.exit(0)
 
+if sys.argv[1:3] == ["agent", "list"]:  # dùng để kiểm tra tên agent người dùng nhập
+    print(json.dumps(["oracle", "nop", "slow", "terminus-2", "claude-code", "codex"]))
+    sys.exit(0)
+
 ap = argparse.ArgumentParser()
 ap.add_argument("cmd")
 ap.add_argument("-p")

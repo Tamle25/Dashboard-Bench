@@ -75,10 +75,15 @@ export interface ModelEndpoint {
   agent: string | null;
   secret_name: string | null;
   secret_present: boolean | null;
+  // oauth: bí mật là token gói Claude Pro/Max thay cho API key (chỉ agent claude-code).
+  auth: ModelAuth;
   status: ModelStatus;
   latency_ms: number | null;
   last_error: string | null;
   checked_at: string | null;
+  // Đã xuất hiện trong lượt chạy nào chưa (thí sinh hoặc giám khảo). Xoá mô hình như vậy
+  // cần xác nhận thêm vì nó còn hiện trên bảng xếp hạng.
+  used: boolean | null;
 }
 
 export interface ModelInput {
@@ -90,7 +95,10 @@ export interface ModelInput {
   model_name?: string | null;
   secret_name?: string | null;
   agent?: string | null;
+  auth?: ModelAuth;
 }
+
+export type ModelAuth = "api_key" | "oauth";
 
 export interface RunParams {
   temperature: number;

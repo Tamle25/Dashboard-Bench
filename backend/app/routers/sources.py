@@ -92,9 +92,12 @@ async def create_source(body: SourceIn, db: Session = Depends(get_db)):
     if not (git_ops.is_remote(url) or git_ops.is_local(url)):
         raise HTTPException(422, "URL repo không hợp lệ")
     repo, host = git_ops.describe(url)
-    if db.scalar(select(Source).where(Source.url == url, Source.ref == body.ref)):
-        raise HTTPException(409, f"Repo {repo} ({body.ref}) đã được kết nối")
-    s = Source(repo=repo, url=url, host=host, ref=body.ref.strip(), manifest_path=body.manifest_path.strip(), auth=body.auth, sync_mode=body.sync_mode)
+    ref = body.ref.strip()
+    # So sánh trên ref ĐÃ strip: bản lưu cũng là ref đã strip, nên nếu so bản thô thì "  main  "
+    # lọt qua và tạo nguồn thứ hai y hệt — bộ bench sẽ hiện hai lần ở màn Chạy mới.
+    if db.scalar(select(Source).where(Source.url == url, Source.ref == ref)):
+        raise HTTPException(409, f"Repo {repo} ({ref}) đã được kết nối")
+    s = Source(repo=repo, url=url, host=host, ref=ref, manifest_path=body.manifest_path.strip(), auth=body.auth, sync_mode=body.sync_mode)
     db.add(s)
     db.commit()
     if body.secret:
@@ -111,7 +114,10 @@ async def update_source(source_id: int, body: SourcePatch, db: Session = Depends
         if val is not None:
             setattr(s, field, val.strip() if isinstance(val, str) else val)
     db.commit()
-    if body.secret:
+    if s.auth == "public":
+        # Chuyển sang công khai thì token/khoá cũ không còn lý do tồn tại: xoá khỏi kho bí mật.
+        secrets.delete(source_secret_name(s.id))
+    elif body.secret:
         secrets.set(source_secret_name(s.id), body.secret)
     spawn(sync_source(s.id))
     return source_out(s)

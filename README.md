@@ -132,6 +132,27 @@ Máy chủ phải truy cập được từ GitHub/GitLab. Nếu không, chọn c
 - Nhập Base URL, ví dụ `http://gpu-node:8000/v1` (vLLM, TGI, Ollama, LM Studio và hầu hết nhà cung cấp API đều hỗ trợ).
 - Nếu cần API key: điền **tên** biến bí mật (ví dụ `MODEL_X_API_KEY`), rồi đặt giá trị trong `backend/.env`.
 
+Kiểu "Agent Harbor": điền tên agent (`oracle`, `nop`, `terminus-2`, `claude-code`, `codex`…).
+Tên agent được đối chiếu với `harbor agent list`, nên gõ sai sẽ báo ngay ở cột Trạng thái kèm
+gợi ý — không phải chờ tới lúc chạy task mới biết. Agent tuỳ chỉnh dạng `module.path:Class`
+hoặc `acp:opencode@1.3.9` được bỏ qua bước kiểm này.
+
+**Chạy model Claude bằng gói Pro/Max thay API key** (chỉ agent `claude-code`):
+1. Chạy `claude setup-token`, ghi `CLAUDE_CODE_OAUTH_TOKEN=<token>` vào `backend/.env`.
+2. Thêm mô hình kiểu "Agent Harbor", agent `claude-code`, chọn **Xác thực → Gói Claude Pro/Max (OAuth)**,
+   model ví dụ `anthropic/claude-haiku-5-5`. Ô tên bí mật để trống = `CLAUDE_CODE_OAUTH_TOKEN`.
+
+Backend sẽ đặt `CLAUDE_FORCE_OAUTH=1` và gỡ `ANTHROPIC_API_KEY` khỏi môi trường của Harbor, nên
+lượt chạy không tính tiền theo API. Lượt chạy tính vào hạn mức của gói: chạy ít task song song.
+
+Mô hình **được lưu trước, rồi mới thử kết nối**: kết nối hỏng vẫn lưu để bạn sửa lại. Mỗi
+dòng có nút **Sửa** (đổi được mọi thứ trừ tên, vì kết quả đã chạy tham chiếu tới tên) và
+**Xoá**. Xoá mô hình đã có lịch sử chạy cần xác nhận thêm; **kết quả cũ vẫn được giữ** vì bảng
+kết quả chỉ lưu tên mô hình dạng chuỗi. Không sửa/xoá được mô hình đang có trong lượt chạy dở.
+
+Giám khảo phải là mô hình kiểu OpenAI-compatible (hoặc mock): agent Harbor không có endpoint
+Chat Completions nên không chấm được theo rubric, và hệ thống từ chối ngay khi tạo lượt chạy.
+
 ## Kiến trúc
 
 ```
@@ -148,8 +169,8 @@ React ──/api──▶ FastAPI ──▶ SQLite/Postgres  (sources, benches, 
 | Chạy mới | `GET /api/benches`, `GET /api/models`, `POST /api/runs` |
 | Đang chạy | `GET /api/runs/active`, `GET /api/runs/:id/stream` (SSE), `POST /api/runs/:id/cancel` |
 | Chi tiết | `GET /api/results/:id`, `GET /api/results/:id/samples?filter=`, `GET /api/results/:id/export` |
-| Nguồn bench | `GET/POST /api/sources`, `POST /api/sources/test`, `PATCH /api/sources/:id`, `POST /api/sources/:id/sync`, `POST /api/webhooks/git/:id` |
-| Mô hình | `GET/POST /api/models`, `POST /api/models/:id/ping` |
+| Nguồn bench | `GET/POST /api/sources`, `POST /api/sources/test`, `PATCH /api/sources/:id`, `POST /api/sources/:id/sync`, `DELETE /api/sources/:id`, `POST /api/webhooks/git/:id` |
+| Mô hình | `GET/POST /api/models`, `PATCH /api/models/:id`, `POST /api/models/:id/ping`, `DELETE /api/models/:id?force=` |
 
 Tài liệu API tương tác: http://localhost:8000/docs
 

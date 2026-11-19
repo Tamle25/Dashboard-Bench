@@ -35,7 +35,9 @@ export default function NewRunPage() {
   const set = (patch: Partial<Form>) => setForm((f) => ({ ...f, ...patch }));
 
   const contestants = useMemo(() => (models.data || []).filter((m) => m.role !== "judge"), [models.data]);
-  const judges = useMemo(() => (models.data || []).filter((m) => m.role !== "contestant"), [models.data]);
+  // Giám khảo chấm theo rubric qua Chat Completions, nên agent Harbor không làm giám khảo được
+  // (backend cũng từ chối). Loại khỏi danh sách thay vì để chọn rồi hỏng giữa lượt chạy.
+  const judges = useMemo(() => (models.data || []).filter((m) => m.role !== "contestant" && m.kind !== "harbor"), [models.data]);
 
   // Mặc định: bộ bench đầu tiên, hai thí sinh sẵn sàng đầu tiên, giám khảo sẵn sàng đầu tiên.
   useEffect(() => {
@@ -153,7 +155,7 @@ export default function NewRunPage() {
                 <div className="fields" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))" }}>
                   <label className="field">Mô hình giám khảo
                     <select className="input" value={form.judge_id ?? ""} onChange={(e) => set({ judge_id: e.target.value || null })}>
-                      {judges.length === 0 && <option value="">Chưa có giám khảo</option>}
+                      {judges.length === 0 && <option value="">Chưa có giám khảo phù hợp</option>}
                       {judges.map((j) => <option key={j.id} value={j.id}>{j.id}{j.status === "down" ? " (không phản hồi)" : ""}</option>)}
                     </select>
                   </label>

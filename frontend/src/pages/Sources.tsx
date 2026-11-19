@@ -55,6 +55,7 @@ export default function SourcesPage() {
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string>();
   const [notice, setNotice] = useState<string>();
+  const [listError, setListError] = useState<string>();
 
   const setF = (patch: Partial<FormState>) => {
     setForm((f) => ({ ...f, ...patch }));
@@ -96,18 +97,37 @@ export default function SourcesPage() {
 
   async function sync(s: Source) {
     setNotice(undefined);
+    setListError(undefined);
     try {
       await api.syncSource(s.id);
       void sources.reload();
     } catch (e) {
-      setNotice(`Không đồng bộ được ${s.repo}: ${errMsg(e)}`);
+      setListError(`Không đồng bộ được ${s.repo}: ${errMsg(e)}`);
+    }
+  }
+
+  async function remove(s: Source) {
+    setNotice(undefined);
+    setListError(undefined);
+    const n = s.benches.length;
+    if (!window.confirm(`Gỡ kết nối repo ${s.repo}?\n\n${n} bộ bench của repo này sẽ biến mất khỏi màn Chạy mới. Token/khoá đã lưu cũng bị xoá.`)) return;
+    try {
+      await api.deleteSource(s.id);
+      if (form.editId === s.id) close();
+      setNotice(`Đã gỡ kết nối ${s.repo}.`);
+      void sources.reload();
+    } catch (e) {
+      // 409 khi repo đã có lượt chạy: giữ nguyên để lịch sử kết quả không bị gãy.
+      setListError(errMsg(e));
     }
   }
 
   const edit = (s: Source) => {
     setNotice(undefined);
+    setListError(undefined);
     setTest(null);
     setForm({ open: true, editId: s.id, url: s.url, ref: s.ref, manifest_path: s.manifest_path, auth: s.auth, secret: "", sync_mode: s.sync_mode });
+    document.getElementById("cn-h")?.scrollIntoView({ behavior: "smooth", block: "center" });
   };
 
   const list = sources.data || [];
@@ -210,13 +230,14 @@ export default function SourcesPage() {
       )}
 
       {notice && <p role="status" className="notice ok">{notice}</p>}
+      {listError && <p role="alert" className="notice err">{listError}</p>}
 
       <section aria-labelledby="src-h" className="card flush-bottom">
         <h2 id="src-h" className="card-title" style={{ marginBottom: 6 }}>Repo đã kết nối</h2>
         {sources.error && <ErrorNotice error={sources.error} retry={sources.reload} />}
         {sources.loading && !sources.data && <Loading />}
         {sources.data?.length === 0 && <p className="muted" style={{ padding: "12px 0 16px", margin: 0 }}>Chưa kết nối repo nào. Bấm “Kết nối repo” để bắt đầu.</p>}
-        {list.map((s) => <SourceRow key={s.id} s={s} onSync={() => sync(s)} onFix={() => edit(s)} />)}
+        {list.map((s) => <SourceRow key={s.id} s={s} onSync={() => sync(s)} onFix={() => edit(s)} onDelete={() => remove(s)} />)}
       </section>
 
       <div className="pair">
@@ -243,7 +264,7 @@ export default function SourcesPage() {
   );
 }
 
-function SourceRow({ s, onSync, onFix }: { s: Source; onSync: () => void; onFix: () => void }) {
+function SourceRow({ s, onSync, onFix, onDelete }: { s: Source; onSync: () => void; onFix: () => void; onDelete: () => void }) {
   const st = SOURCE_STATUS[s.status];
   const syncing = s.status === "syncing" || s.status === "pending";
   const isErr = s.status === "error";
@@ -274,9 +295,14 @@ function SourceRow({ s, onSync, onFix }: { s: Source; onSync: () => void; onFix:
             {syncing ? (s.synced_at ? "đang lấy commit mới…" : "lần đầu: đang tải toàn bộ repo…") : `Đồng bộ: ${s.synced_at ? fmtWhen(s.synced_at) : "chưa lần nào"}`}
           </span>
         </span>
-        {isErr && <button type="button" className="btn btn-danger btn-sm" onClick={onFix}>Cập nhật kết nối</button>}
+        <button type="button" className={`btn btn-sm ${isErr ? "btn-danger" : ""}`} onClick={onFix} aria-label={`Sửa kết nối ${s.repo}`}>
+          <Icon d={ICONS.edit} size={15} color={isErr ? "var(--err)" : undefined} />{isErr ? "Cập nhật kết nối" : "Sửa"}
+        </button>
         <button type="button" className="btn btn-sm" disabled={syncing} onClick={onSync} aria-label={`Đồng bộ ${s.repo}`}>
           <Icon d={ICONS.sync} size={15} />{syncing ? "Đang đồng bộ…" : "Đồng bộ"}
+        </button>
+        <button type="button" className="btn btn-sm btn-danger" onClick={onDelete} aria-label={`Gỡ kết nối ${s.repo}`}>
+          <Icon d={ICONS.trash} size={15} color="var(--err)" />
         </button>
       </div>
       {s.message && <p className={`notice ${isErr ? "err" : "warn"}`} style={{ flex: "1 1 100%" }}>{s.message}</p>}

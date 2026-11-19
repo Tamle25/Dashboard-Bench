@@ -111,15 +111,24 @@ class RunManager:
     # ---------- vòng đời ----------
     async def startup(self) -> None:
         self.client = httpx.AsyncClient()
+        interrupted: list[int] = []
         with SessionLocal() as db:
             for run in db.scalars(select(Run).where(Run.status.in_(ACTIVE))):
                 run.status = "failed"
                 run.error = "Máy chủ khởi động lại khi lượt chạy đang diễn ra."
                 run.finished_at = now()
+                interrupted.append(run.id)
                 for e in run.entries:
                     if e.status in ACTIVE:
                         e.status = "failed"
             db.commit()
+        # Máy chủ chết giữa lượt chạy (crash, bị giết) thì không ai gỡ container của các task
+        # đang dở, và agent bên trong vẫn chạy tiếp. Dọn ở đây.
+        for run_id in interrupted:
+            jobs_dir = settings.data_dir / "harbor-jobs" / f"run-{run_id}"
+            if jobs_dir.is_dir():
+                for job_dir in (d for d in jobs_dir.iterdir() if d.is_dir()):
+                    await asyncio.to_thread(harbor.remove_job_containers, job_dir)
 
     async def shutdown(self) -> None:
         for t in list(self.tasks.values()):
@@ -197,9 +206,18 @@ class RunManager:
                 if e.status == "failed":
                     continue
                 rows = db.scalars(select(SampleResult).where(SampleResult.entry_id == e.id, SampleResult.needs_review.is_(False))).all()
-                e.score = round(sum(r.value for r in rows) / len(rows) * 100, 1) if rows else 0.0
-                e.status = "done"
                 e.finished_at = now()
+                if not rows:
+                    # Không mẫu nào chấm được (vd. giám khảo lỗi, verifier Harbor không trả reward).
+                    # Để điểm trống và trạng thái failed: nếu gán 0 điểm, bảng xếp hạng sẽ hiểu
+                    # là mô hình trả lời sai hết, trong khi thực tế là lỗi cấu hình.
+                    e.score = None
+                    e.status = "failed"
+                    e.error = e.error or f"Không chấm được mẫu nào trong {e.total} mẫu ({e.review} cần xem lại)."
+                    self.log(db, run, "ERROR", f"{e.model_id} không có mẫu nào chấm được ({e.review}/{e.total} cần xem lại) → không tính điểm")
+                    continue
+                e.score = round(sum(r.value for r in rows) / len(rows) * 100, 1)
+                e.status = "done"
                 self.log(db, run, "DONE", f"{e.model_id} hoàn tất {e.done}/{e.total} mẫu, điểm {e.score:.1f}".replace(".", ","))
             run.status = "done" if any(e.status == "done" for e in run.entries) else "failed"
             secs = int((now() - run.started_at.replace(tzinfo=now().tzinfo)).total_seconds()) if run.started_at else 0
@@ -319,6 +337,13 @@ class RunManager:
 
         await asyncio.gather(*(one(e, t) for e in run.entries for t in picked))
 
+    @staticmethod
+    def _stop_harbor(proc, job_dir: Path) -> None:
+        """Dừng Harbor rồi gỡ container của task: agent chạy trong container, không gỡ thì
+        nó vẫn chạy tiếp sau khi người dùng bấm Dừng."""
+        harbor.stop_process(proc)
+        harbor.remove_job_containers(job_dir)
+
     async def _harbor_task(self, db: Session, run: Run, entry: RunEntry, ep: ModelEndpoint, task, jobs_dir: Path) -> None:
         job = f"e{entry.id}-{task.name}"
         cmd, env = harbor.build_command(ep, task.path, jobs_dir, job)
@@ -327,7 +352,8 @@ class RunManager:
         try:
             rc = await asyncio.to_thread(proc.wait)
         except asyncio.CancelledError:
-            await asyncio.to_thread(harbor.stop_process, proc)
+            # shield: dọn dẹp phải chạy hết dù task bị huỷ thêm lần nữa (vd. tắt máy chủ).
+            await asyncio.shield(asyncio.to_thread(self._stop_harbor, proc, jobs_dir / job))
             raise
         outcome = harbor.read_trial(jobs_dir / job)
 

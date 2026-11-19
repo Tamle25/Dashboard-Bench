@@ -77,6 +77,9 @@ class ModelEndpoint(Base):
     model_name: Mapped[str | None] = mapped_column(String(200))
     # Tên bí mật (biến môi trường hoặc kho bí mật) chứa API key. Không lưu key trong DB.
     secret_name: Mapped[str | None] = mapped_column(String(200))
+    # api_key: bí mật là API key. oauth: bí mật là token gói Claude Pro/Max (`claude setup-token`),
+    # chỉ dùng cho agent Harbor claude-code. NULL (hàng cũ trước khi có cột) = api_key.
+    auth: Mapped[str | None] = mapped_column(String(20), default="api_key")
     status: Mapped[str] = mapped_column(String(20), default="unknown")  # unknown | checking | ok | down
     latency_ms: Mapped[int | None] = mapped_column(Integer)
     last_error: Mapped[str | None] = mapped_column(Text)

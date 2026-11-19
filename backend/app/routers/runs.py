@@ -69,6 +69,11 @@ async def create_run(body: RunIn, db: Session = Depends(get_db)):
         judge = db.get(ModelEndpoint, body.judge_id) if body.judge_id else None
         if judge is None or judge.role == "contestant":
             raise HTTPException(422, "Bộ bench này cần chọn một giám khảo hợp lệ")
+        # Giám khảo được gọi qua Chat Completions để chấm theo rubric; agent Harbor không có
+        # endpoint như vậy. Không chặn ở đây thì lượt chạy vẫn tiêu hết lượt gọi thí sinh rồi
+        # mới hỏng ở từng mẫu một.
+        if judge.kind not in ("openai", "mock"):
+            raise HTTPException(422, f"{judge.id} là agent Harbor, không chấm được theo rubric; chọn giám khảo kiểu OpenAI-compatible")
         judge_id = judge.id
     params = body.model_dump(include={"temperature", "max_tokens", "samples", "concurrency", "seed"})
     run = Run(bench_id=bench.id, source_sha=bench.source.sha, judge_id=judge_id, threshold=body.threshold, params=params)

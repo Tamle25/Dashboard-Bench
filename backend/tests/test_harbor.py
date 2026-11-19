@@ -126,6 +126,56 @@ def test_build_command_for_openai_endpoint(monkeypatch):
         harbor.build_command(ModelEndpoint(id="m", kind="mock", base_url="mock://1"), Path("/t"), Path("/j"), "j")
 
 
+def test_build_command_for_claude_subscription(monkeypatch):
+    """OAuth: token phải tới claude-code dưới đúng tên CLAUDE_CODE_OAUTH_TOKEN, không đi qua
+    --api-key-name (Harbor sẽ coi nó là ANTHROPIC_API_KEY), và API key sẵn có bị gỡ để lượt
+    chạy không âm thầm tính tiền theo API."""
+    monkeypatch.setenv("MY_CLAUDE_TOKEN", "sk-ant-oat-test")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api-should-not-leak")
+    ep = ModelEndpoint(id="haiku-sub", kind="harbor", agent="claude-code", model_name="anthropic/claude-haiku-5-5",
+                       secret_name="MY_CLAUDE_TOKEN", auth="oauth")
+    cmd, env = harbor.build_command(ep, Path("/t/task"), Path("/jobs"), "job1")
+    s = " ".join(cmd)
+    assert "-a claude-code" in s and "-m anthropic/claude-haiku-5-5" in s and "--api-key-name" not in s
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-test" and env["CLAUDE_FORCE_OAUTH"] == "1"
+    assert "ANTHROPIC_API_KEY" not in env
+
+    monkeypatch.delenv("MY_CLAUDE_TOKEN")
+    with pytest.raises(harbor.HarborError, match="thiếu bí mật"):
+        harbor.build_command(ep, Path("/t/task"), Path("/jobs"), "job1")
+
+
+def test_stop_removes_task_containers(tmp_path, monkeypatch):
+    """Agent chạy trong container: dừng Harbor thôi thì agent vẫn chạy tiếp (run-27 tiêu
+    thêm ~25 phút hạn mức sau khi đã bấm Dừng). Phải gỡ container theo project compose."""
+    import subprocess
+    from types import SimpleNamespace
+
+    job = tmp_path / "e34-formal-crypto"
+    (job / "formal-crypto__dHCKUK7").mkdir(parents=True)
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        out = ""
+        if cmd[1:3] == ["container", "ls"] and cmd[-1].endswith("=formal-crypto__dhckuk7__env"):
+            out = "abc123\n"
+        if cmd[1:3] == ["network", "ls"]:
+            out = "net1\n"
+        return SimpleNamespace(returncode=0, stdout=out)
+
+    monkeypatch.setattr(harbor.settings, "harbor_env", "docker")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    assert harbor.remove_job_containers(job) == ["formal-crypto__dhckuk7__env"]
+    assert ["docker", "rm", "-f", "abc123"] in calls
+    assert ["docker", "network", "rm", "net1"] in calls
+
+    # Môi trường không phải docker: không đụng tới Docker
+    calls.clear()
+    monkeypatch.setattr(harbor.settings, "harbor_env", "fake")
+    assert harbor.remove_job_containers(job) == [] and calls == []
+
+
 def test_auto_detect_source_without_manifest(client, harbor_repo):
     test = client.post("/api/sources/test", json={"url": str(harbor_repo)}).json()
     assert test["ok"], test

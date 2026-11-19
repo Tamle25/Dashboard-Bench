@@ -13,6 +13,7 @@ rồi đọc <jobs_dir>/<job>/<trial>/result.json để lấy reward.
 
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -120,8 +121,6 @@ def count_tasks_from_paths(paths: set[str], data: str, exclude: list[str] | None
 
 def synthesize_manifest(root: Path | None = None, dirs: list[tuple[str, int]] | None = None) -> str | None:
     """Sinh manifest YAML tạm cho repo Harbor chưa có bench.yaml."""
-    import re
-
     import yaml
 
     if dirs is None:
@@ -183,7 +182,71 @@ def preflight() -> str:
     return version
 
 
+# Một dòng của bảng `harbor agent list` khi CLI không hỗ trợ --json. Viền bảng là ký tự
+# box-drawing Unicode (│), không phải "|" ASCII — nhiều terminal hiển thị thành "|".
+_AGENT_ROW = re.compile(r"^[|│]\s*([A-Za-z0-9][A-Za-z0-9._:@/-]*)\s*[|│]$")
+_agents_cache: list[str] | None = None
+
+
+def _run_agent_list(*args: str) -> str | None:
+    try:
+        p = subprocess.run([*settings.harbor_cmd, "agent", "list", *args], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return p.stdout if p.returncode == 0 else None
+
+
+def list_agents(refresh: bool = False) -> list[str]:
+    """Tên các agent Harbor cài sẵn (đọc `harbor agent list`, nhớ lại trong tiến trình).
+
+    Trả về danh sách rỗng khi không gọi được CLI — khi đó bỏ qua bước kiểm tra tên thay vì
+    chặn người dùng vì một lệnh phụ không chạy được.
+    """
+    global _agents_cache
+    if _agents_cache is not None and not refresh:
+        return _agents_cache
+    names: list[str] = []
+    out = _run_agent_list("--json")
+    if out:
+        try:
+            data = json.loads(out)
+            names = [str(x) for x in data] if isinstance(data, list) else []
+        except json.JSONDecodeError:
+            names = []
+    if not names:  # Harbor cũ chưa có --json: đọc bảng đã render
+        out = _run_agent_list()
+        names = [m.group(1) for line in (out or "").splitlines() if (m := _AGENT_ROW.match(line.strip())) and m.group(1).lower() != "name"]
+    if names:
+        _agents_cache = names
+    return names
+
+
+def check_agent(name: str) -> None:
+    """Báo lỗi nếu Harbor không có agent tên này.
+
+    Bỏ qua agent dạng đường dẫn tuỳ chỉnh (`module.path:Class`) và shorthand ACP
+    (`acp:opencode@1.3.9`): hai dạng này không có trong danh sách và chỉ Harbor mới giải được.
+    """
+    if not name or ":" in name or "/" in name or "." in name:
+        return
+    agents = list_agents()
+    if not agents or name in agents:
+        return
+    # Gợi ý tên gần đúng: lỗi hay gặp nhất là sai dấu gạch ("terminus2" ↔ "terminus-2"),
+    # nên so cả bản đã bỏ hết ký tự ngăn cách.
+    flat = re.sub(r"[^a-z0-9]", "", name.lower())
+    low = name.lower()
+    near = [a for a in agents if re.sub(r"[^a-z0-9]", "", a.lower()) == flat]
+    near += [a for a in agents if a not in near and (low in a.lower() or a.lower() in low)]
+    hint = f" Có phải: {', '.join(near[:3])}?" if near else ""
+    raise HarborError(f"Harbor không có agent '{name}'.{hint} Xem danh sách bằng: harbor agent list")
+
+
 # ---------------------------------------------------------------- dựng lệnh
+
+# Xác thực bằng gói Claude Pro/Max thay cho API key: chỉ agent claude-code hỗ trợ.
+OAUTH_AGENT = "claude-code"
+OAUTH_ENV = "CLAUDE_CODE_OAUTH_TOKEN"
 
 def build_command(ep: ModelEndpoint, task_path: Path, jobs_dir: Path, job_name: str) -> tuple[list[str], dict]:
     cmd = [
@@ -192,17 +255,28 @@ def build_command(ep: ModelEndpoint, task_path: Path, jobs_dir: Path, job_name: 
         "-e", settings.harbor_env, "-n", "1", "-y", "-q",
     ]
     env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
+    oauth = ep.auth == "oauth"
     if ep.kind == "harbor":
         if not ep.agent:
             raise HarborError(f"{ep.id}: chưa đặt agent Harbor")
+        check_agent(ep.agent)
         cmd += ["-a", ep.agent]
         if ep.model_name:
             cmd += ["-m", ep.model_name]
-        if ep.secret_name:
+        if oauth:
+            # Gói Claude Pro/Max: claude-code đọc CLAUDE_CODE_OAUTH_TOKEN, còn CLAUDE_FORCE_OAUTH
+            # bắt nó bỏ API key. KHÔNG truyền --api-key-name: Harbor sẽ đổ token vào
+            # ANTHROPIC_API_KEY và xác thực hỏng. Gỡ luôn API key có sẵn trong môi trường để
+            # lượt chạy không âm thầm tính tiền theo API.
+            env.pop("ANTHROPIC_API_KEY", None)
+            env.pop("ANTHROPIC_AUTH_TOKEN", None)
+            env["CLAUDE_FORCE_OAUTH"] = "1"
+        elif ep.secret_name:
             # Nói rõ cho Harbor biến môi trường nào chứa API key, nếu không nó chỉ tìm theo
             # tên mặc định của agent (codex: OPENAI_API_KEY) và ô "Tên bí mật" sẽ vô nghĩa.
             cmd += ["--api-key-name", ep.secret_name]
     elif ep.kind == "openai":
+        check_agent(ep.agent or "terminus-2")
         cmd += ["-a", ep.agent or "terminus-2", "-m", ep.model_name or ep.id, "--base-url", ep.base_url, "--api-format", "openai_chat_completions"]
         if ep.secret_name:
             cmd += ["--api-key-name", ep.secret_name]
@@ -213,6 +287,10 @@ def build_command(ep: ModelEndpoint, task_path: Path, jobs_dir: Path, job_name: 
         if not value:
             raise HarborError(f"{ep.id}: thiếu bí mật {ep.secret_name}")
         env[ep.secret_name] = value
+        if oauth:
+            env[OAUTH_ENV] = value  # tên bí mật có thể khác tên biến claude-code đọc
+    elif oauth:
+        raise HarborError(f"{ep.id}: thiếu token OAuth")
     cmd += settings.harbor_extra_args
     return cmd, env
 
@@ -255,6 +333,42 @@ def stop_process(proc: subprocess.Popen, grace_s: float = 30) -> None:
         proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
         pass
+
+
+def _docker_ids(kind: str, project: str) -> list[str]:
+    r = subprocess.run(
+        ["docker", kind, "ls", "-aq" if kind == "container" else "-q", "--filter", f"label=com.docker.compose.project={project}"],
+        capture_output=True, text=True, timeout=30,
+    )
+    return r.stdout.split() if r.returncode == 0 else []
+
+
+def remove_job_containers(job_dir: Path) -> list[str]:
+    """Gỡ container + network của mọi trial trong một job Harbor. Trả về các project đã dọn.
+
+    Phải gọi sau khi dừng Harbor: agent (vd. claude-code) chạy BÊN TRONG container qua
+    `docker exec`, nên giết tiến trình Harbor trên máy chủ không làm agent dừng — nó cứ chạy
+    tiếp và tiêu token/hạn mức. Harbor tự dọn khi thoát êm, nhưng trên Windows CTRL_BREAK
+    giết Python ngay lập tức (không thành KeyboardInterrupt), nên bước dọn của nó không chạy.
+
+    Tên project compose của Harbor là `<thư mục trial>__env`, viết thường.
+    """
+    if settings.harbor_env != "docker" or not job_dir.is_dir():
+        return []
+    removed: list[str] = []
+    for trial in (d for d in job_dir.iterdir() if d.is_dir()):
+        project = f"{trial.name.lower()}__env"
+        try:
+            ids = _docker_ids("container", project)
+            if ids:
+                subprocess.run(["docker", "rm", "-f", *ids], capture_output=True, timeout=120)
+                removed.append(project)
+            nets = _docker_ids("network", project)
+            if nets:
+                subprocess.run(["docker", "network", "rm", *nets], capture_output=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            continue  # Docker không phản hồi: không chặn việc dừng lượt chạy
+    return removed
 
 
 def tail(path: Path, n: int = 1500) -> str:
