@@ -20,7 +20,7 @@ Bộ bench dạng Harbor / Terminal-Bench (mỗi task là một thư mục có t
     name: VN Lớp A · có dấu
     data: vn-bench/layer-a/build/vi           # thư mục chứa các task
     prepare: python vn-bench/layer-a/build_variants.py --variants vi   # tuỳ chọn
-    exclude: [atrx-vep-crispr]                # tuỳ chọn
+    exclude: [atrx-vep-crispr, "*-draft"]     # tuỳ chọn; tên chính xác hoặc mẫu glob
     scoring:
       type: harbor                            # điểm = reward do verifier của task ghi ra
 
@@ -60,7 +60,7 @@ class BenchSpec(BaseModel):
     judge_required: bool | None = None
     # Lệnh chạy trong repo trước khi dùng bộ bench (vd. sinh task biến thể). Chuỗi hoặc danh sách lệnh.
     prepare: str | list[str] | None = None
-    # Tên thư mục task bỏ qua (chỉ cho type = harbor).
+    # Tên thư mục task bỏ qua (chỉ cho type = harbor). Nhận tên chính xác hoặc mẫu glob (`*-ask_human`).
     exclude: list[str] = []
 
     @property

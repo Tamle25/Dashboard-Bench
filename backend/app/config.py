@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     harbor_env: str = "docker"
     # Tham số thêm cho mọi lệnh `harbor run`, ví dụ ["--timeout-multiplier", "0.5"].
     harbor_extra_args: list[str] = []
+    # Gỡ image Docker của task sau khi chấm xong (chỉ khi harbor_env = docker). Mỗi task thường có
+    # image riêng 1–9 GB; giữ lại thì ổ đĩa đầy sau vài chục task. Kết quả và log vẫn giữ nguyên.
+    # Tắt (false) nếu muốn chạy lại cùng task nhiều lần mà không phải kéo/build lại image.
+    harbor_cleanup_images: bool = True
     # Thời gian tối đa cho bước "prepare" của manifest (giây).
     prepare_timeout_s: int = 900
 

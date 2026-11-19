@@ -93,7 +93,11 @@ Repo kiểu [terminal-bench](https://github.com/harbor-framework/terminal-bench)
 - **Không có `bench.yaml`**: hệ thống tự nhận diện các thư mục chứa task. Nó bỏ qua `scripts/`, `leaderboard/`, thư mục bắt đầu bằng `_`, và thư mục chỉ có 1 task.
 - **Có `bench.yaml`**: khai báo `scoring.type: harbor`, `data:` là thư mục chứa task. Có thể thêm:
   - `prepare:`: lệnh sinh task trước khi chạy, ví dụ `build_variants.py`.
-  - `exclude:`: danh sách task bỏ qua.
+  - `exclude:`: danh sách task bỏ qua, theo tên chính xác hoặc mẫu glob (vd. `"*-ask_human"`).
+- Dọn dẹp tự động (môi trường `docker`): chấm xong một task là gỡ image Docker của task đó (image kéo
+  sẵn và image Harbor tự build), vì mỗi task có thể chiếm 1–9 GB. Kết quả và log trong
+  `data/harbor-jobs/` được giữ nguyên. Tắt bằng `BENCH_HARBOR_CLEANUP_IMAGES=false`. Khi khởi động,
+  backend cũng xoá worktree còn sót của các lượt chạy bị ngắt giữa chừng.
 
   Mẫu cho repo vn-bench: [examples/terminal-bench-lct/bench.yaml](examples/terminal-bench-lct/bench.yaml).
 - **Thí sinh** cho bộ bench Harbor:

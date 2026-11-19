@@ -8,7 +8,7 @@ pub/sub trong bộ nhớ bằng Redis pub/sub; API và giao diện giữ nguyên
 import asyncio
 import json
 import random
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable
 from pathlib import Path
 
@@ -102,11 +102,21 @@ def prepare_workspace(src: Source, sha: str | None, run_id: int) -> tuple[Path, 
     return dest, lambda: git_ops.remove_worktree(repo_dir, dest)
 
 
+def remove_stale_worktrees(paths: list[Path]) -> None:
+    for p in paths:
+        if p.is_dir():
+            git_ops.remove_tree(p)
+    if settings.cache_dir.is_dir():
+        for repo in (d for d in settings.cache_dir.iterdir() if d.is_dir()):
+            git_ops.prune_worktrees(repo)
+
+
 class RunManager:
     def __init__(self) -> None:
         self.tasks: dict[int, asyncio.Task] = {}
         self.subs: dict[int, set[asyncio.Queue]] = defaultdict(set)
         self.client: httpx.AsyncClient | None = None
+        self._bg_cleanup: asyncio.Task | None = None
 
     # ---------- vòng đời ----------
     async def startup(self) -> None:
@@ -129,6 +139,12 @@ class RunManager:
             if jobs_dir.is_dir():
                 for job_dir in (d for d in jobs_dir.iterdir() if d.is_dir()):
                     await asyncio.to_thread(harbor.remove_job_containers, job_dir)
+        # Worktree của lượt chạy bị ngắt (máy chủ tắt/khởi động lại giữa chừng) không ai xoá, mỗi
+        # cái là một bản checkout đầy đủ của repo bench (vài trăm MB). Lúc này chưa lượt nào chạy,
+        # nên chụp danh sách ngay rồi xoá ở nền: worktree của lượt mới tạo sau đó không bị đụng.
+        stale = sorted(settings.worktree_dir.iterdir()) if settings.worktree_dir.is_dir() else []
+        if stale:
+            self._bg_cleanup = asyncio.create_task(asyncio.to_thread(remove_stale_worktrees, stale))
 
     async def shutdown(self) -> None:
         for t in list(self.tasks.values()):
@@ -330,18 +346,52 @@ class RunManager:
         jobs_dir = (settings.data_dir / "harbor-jobs" / f"run-{run.id}").resolve()
         sem = asyncio.Semaphore(int(p["concurrency"]))
 
+        # Gỡ image Docker của task ngay khi không còn thí sinh nào cần nó (image dùng chung giữa
+        # các task, vd. ask-human của HiL-Bench, chờ tới lượt dùng cuối). Log/kết quả giữ nguyên.
+        prebuilt = {t.name: harbor.task_images(t.path) for t in picked}
+        task_left = Counter({t.name: len(run.entries) for t in picked})
+        image_left = Counter(ref for t in picked for ref in prebuilt[t.name] for _ in run.entries)
+        started: set[str] = set()
+        cleaned: set[str] = set()
+
+        def trials_of(task_name: str) -> list[str]:
+            return [n for e in run.entries for n in harbor.trial_names(jobs_dir / f"e{e.id}-{task_name}")]
+
+        async def release(task: harbor.TaskInfo) -> None:
+            task_left[task.name] -= 1
+            for ref in prebuilt[task.name]:
+                image_left[ref] -= 1
+            if task_left[task.name] > 0:
+                return
+            cleaned.add(task.name)
+            refs = {r for r in prebuilt[task.name] if image_left[r] <= 0}
+            n, size = await asyncio.to_thread(harbor.cleanup_task_images, refs, trials_of(task.name))
+            if n:
+                self.log(db, run, "INFO", f"Dọn task {task.name}: gỡ {n} image Docker ({harbor.fmt_bytes(size)})")
+
         async def one(entry: RunEntry, task: harbor.TaskInfo) -> None:
             async with sem:
+                started.add(task.name)
                 await self._harbor_task(db, run, entry, endpoints[entry.model_id], task, jobs_dir)
                 self.progress(run)
+                await release(task)  # vẫn giữ chỗ trong sem: task sau chưa kéo image khi đang gỡ
 
-        await asyncio.gather(*(one(e, t) for e in run.entries for t in picked))
+        try:
+            await asyncio.gather(*(one(e, t) for e in run.entries for t in picked))
+        finally:
+            # Lượt chạy bị dừng / lỗi giữa chừng: gỡ image của các task đã bắt đầu mà chưa dọn.
+            leftover = [n for n in started if n not in cleaned]
+            if leftover:
+                refs = set().union(*(prebuilt[n] for n in leftover))
+                names = [t for n in leftover for t in trials_of(n)]
+                await asyncio.shield(asyncio.to_thread(harbor.cleanup_task_images, refs, names))
 
     @staticmethod
     def _stop_harbor(proc, job_dir: Path) -> None:
         """Dừng Harbor rồi gỡ container của task: agent chạy trong container, không gỡ thì
         nó vẫn chạy tiếp sau khi người dùng bấm Dừng."""
         harbor.stop_process(proc)
+        harbor.kill_orphan_compose(job_dir)
         harbor.remove_job_containers(job_dir)
 
     async def _harbor_task(self, db: Session, run: Run, entry: RunEntry, ep: ModelEndpoint, task, jobs_dir: Path) -> None:
@@ -355,6 +405,10 @@ class RunManager:
             # shield: dọn dẹp phải chạy hết dù task bị huỷ thêm lần nữa (vd. tắt máy chủ).
             await asyncio.shield(asyncio.to_thread(self._stop_harbor, proc, jobs_dir / job))
             raise
+        if await asyncio.to_thread(harbor.kill_orphan_compose, jobs_dir / job):
+            await asyncio.to_thread(harbor.remove_job_containers, jobs_dir / job)
+            run.warns += 1
+            self.log(db, run, "WARN", f"{ep.id} · task {task.name} · Harbor để lại tiến trình docker compose đang chạy → đã dừng")
         outcome = harbor.read_trial(jobs_dir / job)
 
         if outcome is None or not outcome.valid:

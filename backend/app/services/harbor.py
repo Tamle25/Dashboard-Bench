@@ -11,6 +11,7 @@ Backend gọi `harbor run -p <task> -a <agent> …` cho từng task (một tiế
 rồi đọc <jobs_dir>/<job>/<trial>/result.json để lấy reward.
 """
 
+import fnmatch
 import json
 import os
 import re
@@ -54,12 +55,16 @@ class TaskInfo:
     instruction: str
 
 
+def is_excluded(name: str, exclude: list[str] | None) -> bool:
+    """Tên task khớp một mục trong `exclude`: tên chính xác hoặc mẫu glob (vd. `*-ask_human`)."""
+    return any(name == pat or fnmatch.fnmatchcase(name, pat) for pat in exclude or [])
+
+
 def list_tasks(task_root: Path, exclude: list[str] | None = None) -> list[TaskInfo]:
-    excl = set(exclude or [])
     out: list[TaskInfo] = []
     for d in sorted(p for p in task_root.iterdir() if p.is_dir()):
         toml = d / "task.toml"
-        if d.name in excl or d.name.startswith(("_", ".")) or not toml.is_file():
+        if is_excluded(d.name, exclude) or d.name.startswith(("_", ".")) or not toml.is_file():
             continue
         category = ""
         try:
@@ -114,9 +119,8 @@ def detect_harbor_dirs_from_paths(paths: set[str], max_depth: int = 4) -> list[t
 
 def count_tasks_from_paths(paths: set[str], data: str, exclude: list[str] | None = None) -> int:
     prefix = data.strip("/") + "/"
-    excl = set(exclude or [])
     names = {p[len(prefix):].split("/", 1)[0] for p in paths if p.startswith(prefix) and p.endswith("/task.toml") and p[len(prefix):].count("/") == 1}
-    return len({n for n in names - excl if not n.startswith(("_", "."))})
+    return len({n for n in names if not is_excluded(n, exclude) and not n.startswith(("_", "."))})
 
 
 def synthesize_manifest(root: Path | None = None, dirs: list[tuple[str, int]] | None = None) -> str | None:
@@ -369,6 +373,142 @@ def remove_job_containers(job_dir: Path) -> list[str]:
         except (OSError, subprocess.TimeoutExpired):
             continue  # Docker không phản hồi: không chặn việc dừng lượt chạy
     return removed
+
+
+# ---------------------------------------------------------------- dọn image sau task
+#
+# Harbor tự gỡ container + volume khi xong trial (`compose down --rmi local`), nhưng `--rmi local`
+# KHÔNG gỡ image có tên: image kéo sẵn (`docker_image`, `image:` của service) và image tự build
+# (`hb__<hash>`, bản cũ là `<trial>__env-main`). Chúng tích lại, mỗi cái 1–9 GB.
+
+COMPOSE_FILES = ("docker-compose.yaml", "docker-compose.yml")
+
+
+def task_images(task_path: Path) -> set[str]:
+    """Image kéo sẵn mà task khai báo: `docker_image` trong task.toml và `image:` của các service
+    trong environment/docker-compose.yaml (bỏ giá trị chứa biến ${…})."""
+    import yaml
+
+    refs: set[str] = set()
+    try:
+        env = tomllib.loads((task_path / "task.toml").read_text(encoding="utf-8")).get("environment") or {}
+        if isinstance(env.get("docker_image"), str) and env["docker_image"].strip():
+            refs.add(env["docker_image"].strip())
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        pass
+    for name in COMPOSE_FILES:
+        f = task_path / "environment" / name
+        if not f.is_file():
+            continue
+        try:
+            doc = yaml.safe_load(f.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, yaml.YAMLError):
+            continue
+        services = doc.get("services") if isinstance(doc, dict) else None
+        for svc in (services or {}).values() if isinstance(services, dict) else ():
+            img = svc.get("image") if isinstance(svc, dict) else None
+            if isinstance(img, str) and img.strip() and "$" not in img:
+                refs.add(img.strip())
+    return refs
+
+
+def _docker(*args: str, timeout: int = 120) -> subprocess.CompletedProcess:
+    return subprocess.run(["docker", *args], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout)
+
+
+def built_images(trial_names: list[str]) -> set[str]:
+    """ID các image compose đã build cho những trial này.
+
+    Compose gắn nhãn `com.docker.compose.project` = project lúc build, mà project của Harbor là
+    `<trial>__env` / `<trial>__verifier__trial` (viết thường).
+    """
+    prefixes = tuple(f"{t.lower()}__" for t in trial_names)
+    if not prefixes:
+        return set()
+    r = _docker("image", "ls", "-q", "--no-trunc", "--filter", "label=com.docker.compose.project")
+    ids = sorted(set(r.stdout.split())) if r.returncode == 0 else []
+    if not ids:
+        return set()
+    r = _docker("image", "inspect", "--format", '{{.Id}} {{index .Config.Labels "com.docker.compose.project"}}', *ids)
+    out: set[str] = set()
+    for line in r.stdout.splitlines():
+        iid, _, project = line.strip().partition(" ")
+        if project.startswith(prefixes):
+            out.add(iid)
+    return out
+
+
+def remove_images(refs: set[str]) -> tuple[int, int]:
+    """Gỡ các image (không dùng -f: image đang có container dùng thì Docker từ chối và ta bỏ qua).
+    Trả về (số image đã gỡ, tổng dung lượng byte)."""
+    removed = freed = 0
+    for ref in sorted(refs):
+        try:
+            size = _docker("image", "inspect", "--format", "{{.Size}}", ref, timeout=60)
+            if size.returncode != 0:
+                continue  # không có trong máy (chưa kéo, hoặc đã gỡ)
+            if _docker("image", "rm", ref, timeout=600).returncode == 0:
+                removed += 1
+                freed += int(size.stdout.strip() or 0)
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            continue
+    return removed, freed
+
+
+def cleanup_task_images(prebuilt: set[str], trial_names: list[str]) -> tuple[int, int]:
+    """Gỡ image kéo sẵn + image tự build của một task. Không làm gì nếu không chạy bằng Docker."""
+    if settings.harbor_env != "docker" or not settings.harbor_cleanup_images:
+        return 0, 0
+    try:
+        refs = set(prebuilt) | built_images(trial_names)
+    except (OSError, subprocess.TimeoutExpired):
+        refs = set(prebuilt)
+    return remove_images(refs)
+
+
+def trial_names(job_dir: Path) -> list[str]:
+    return [d.name for d in job_dir.iterdir() if d.is_dir()] if job_dir.is_dir() else []
+
+
+def fmt_bytes(n: int) -> str:
+    return f"{n / 1e9:.1f} GB".replace(".", ",") if n >= 1e8 else f"{n / 1e6:.0f} MB"
+
+
+def kill_orphan_compose(job_dir: Path) -> int:
+    """Dừng các tiến trình `docker compose` Harbor bỏ lại cho các trial của job này. Trả về số đã dừng.
+
+    Hết thời gian chờ (vd. EnvironmentStartTimeoutError khi đang kéo image) thì Harbor thoát mà
+    không dừng `docker compose up` con: tiến trình đó tiếp tục kéo image ngầm hàng giờ (tốn băng
+    thông, đầy ổ đĩa) và giữ thư mục worktree khiến không xoá được.
+    """
+    if settings.harbor_env != "docker":
+        return 0
+    marks = [f"--project-name {t.lower()}__" for t in trial_names(job_dir)]
+    if not marks:
+        return 0
+    try:
+        if os.name == "nt":
+            ps = ("Get-CimInstance Win32_Process -Filter \"Name='docker.exe' or Name='docker-compose.exe'\" | "
+                  "ForEach-Object { \"$($_.ProcessId) $($_.CommandLine)\" }")
+            r = subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+        else:
+            r = subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return 0
+    killed = 0
+    for line in r.stdout.splitlines():
+        pid, _, cmd = line.strip().partition(" ")
+        if not pid.isdigit() or "compose" not in cmd or not any(m in cmd for m in marks):
+            continue
+        try:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/T", "/F", "/PID", pid], capture_output=True, timeout=30)
+            else:
+                os.kill(int(pid), signal.SIGKILL)
+            killed += 1
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+    return killed
 
 
 def tail(path: Path, n: int = 1500) -> str:

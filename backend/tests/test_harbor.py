@@ -69,6 +69,19 @@ def test_detect_from_paths_matches_filesystem(harbor_repo):
     assert harbor.count_tasks_from_paths(paths, "tasks", ["atrx-vep-crispr"]) == 3
 
 
+def test_exclude_accepts_glob_patterns(tmp_path):
+    names = [f"hil-bench-sql_{i}-{mode}" for i in range(3) for mode in ("baseline", "full_info", "ask_human")]
+    for n in names:
+        (tmp_path / "harbor_sql" / n).mkdir(parents=True)
+        (tmp_path / "harbor_sql" / n / "task.toml").write_text("[metadata]\n", encoding="utf-8")
+    excl = ["*-ask_human", "*-full_info"]
+    picked = [t.name for t in harbor.list_tasks(tmp_path / "harbor_sql", excl)]
+    assert picked == [f"hil-bench-sql_{i}-baseline" for i in range(3)]
+    paths = {f"harbor_sql/{n}/task.toml" for n in names}
+    assert harbor.count_tasks_from_paths(paths, "harbor_sql", excl) == 3
+    assert harbor.count_tasks_from_paths(paths, "harbor_sql", ["hil-bench-sql_0-baseline"]) == 8
+
+
 def test_partial_clone_probe(tmp_path, harbor_repo):
     """fetch_tree_only + list_paths + show_file trên repo git thật (qua file://)."""
     import shutil
@@ -174,6 +187,99 @@ def test_stop_removes_task_containers(tmp_path, monkeypatch):
     calls.clear()
     monkeypatch.setattr(harbor.settings, "harbor_env", "fake")
     assert harbor.remove_job_containers(job) == [] and calls == []
+
+
+def test_task_images_reads_toml_and_compose(tmp_path):
+    t = tmp_path / "hil-bench-sql_3-ask_human"
+    (t / "environment").mkdir(parents=True)
+    (t / "task.toml").write_text('[environment]\ndocker_image = "reg/img@sha256:aaa"\n', encoding="utf-8")
+    (t / "environment" / "docker-compose.yaml").write_text(textwrap.dedent("""
+        services:
+          main: {image: "reg/img@sha256:aaa"}
+          ask-human: {image: "reg/img@sha256:bbb"}
+          sidecar: {image: "${SIDECAR_IMAGE}"}
+          built: {build: .}
+    """), encoding="utf-8")
+    assert harbor.task_images(t) == {"reg/img@sha256:aaa", "reg/img@sha256:bbb"}
+    assert harbor.task_images(tmp_path / "missing") == set()
+
+
+def test_cleanup_task_images(monkeypatch):
+    """Gỡ image kéo sẵn + image compose build cho đúng trial; image không có trong máy thì bỏ qua."""
+    from types import SimpleNamespace
+
+    calls: list[tuple] = []
+    sizes = {"reg/img@sha256:aaa": "1700000000", "sha256:built1": "500000000", "sha256:inuse": "100"}
+
+    def fake_docker(*args, timeout=120):
+        calls.append(args)
+        if args[:2] == ("image", "ls"):
+            return SimpleNamespace(returncode=0, stdout="sha256:built1\nsha256:other\nsha256:inuse\n")
+        if args[:2] == ("image", "inspect") and args[3] != "{{.Size}}":
+            return SimpleNamespace(returncode=0, stdout="sha256:built1 task-a__abc1234__env\nsha256:other otherproj\nsha256:inuse task-a__abc1234__verifier__trial\n")
+        if args[:2] == ("image", "inspect"):
+            ref = args[-1]
+            return SimpleNamespace(returncode=0 if ref in sizes else 1, stdout=sizes.get(ref, ""))
+        if args[:2] == ("image", "rm"):
+            return SimpleNamespace(returncode=1 if args[-1] == "sha256:inuse" else 0, stdout="")
+        raise AssertionError(args)
+
+    monkeypatch.setattr(harbor.settings, "harbor_env", "docker")
+    monkeypatch.setattr(harbor.settings, "harbor_cleanup_images", True)
+    monkeypatch.setattr(harbor, "_docker", fake_docker)
+    n, size = harbor.cleanup_task_images({"reg/img@sha256:aaa", "reg/img@sha256:notpulled"}, ["task-a__ABC1234"])
+    assert (n, size) == (2, 2_200_000_000)
+    rm = {a[-1] for a in calls if a[:2] == ("image", "rm")}
+    assert rm == {"reg/img@sha256:aaa", "sha256:built1", "sha256:inuse"}  # sha256:other không thuộc trial này
+
+    calls.clear()
+    monkeypatch.setattr(harbor.settings, "harbor_cleanup_images", False)
+    assert harbor.cleanup_task_images({"reg/img@sha256:aaa"}, ["task-a__abc1234"]) == (0, 0) and calls == []
+
+
+def test_kill_orphan_compose(tmp_path, monkeypatch):
+    """Harbor hết giờ khi đang kéo image thì bỏ lại `docker compose up` chạy ngầm (run-36:
+    hai tiến trình kéo image thêm hơn 1 giờ sau khi task đã bị đánh lỗi)."""
+    import os
+    import subprocess
+    from types import SimpleNamespace
+
+    job = tmp_path / "e43-hil-bench-swe_40-full_info"
+    (job / "hil-bench-swe_40-full_info__SagPdbq").mkdir(parents=True)
+    listing = (
+        "31668 docker compose --project-name hil-bench-swe_40-full_info__sagpdbq__env --project-directory X up --detach --wait\n"
+        "2616 docker compose --project-name hil-bench-swe_94-full_info__y2mruxq__env up\n"
+        "500 docker ps\n"
+    )
+    killed: list[str] = []
+
+    def fake_run(cmd, **kw):
+        if cmd[0] in ("powershell", "ps"):
+            return SimpleNamespace(returncode=0, stdout=listing)
+        if cmd[0] == "taskkill":
+            killed.append(cmd[-1])
+        return SimpleNamespace(returncode=0, stdout="")
+
+    monkeypatch.setattr(harbor.settings, "harbor_env", "docker")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    if os.name != "nt":
+        monkeypatch.setattr(os, "kill", lambda pid, sig: killed.append(str(pid)))
+    assert harbor.kill_orphan_compose(job) == 1
+    assert killed == ["31668"]  # không đụng compose của task khác
+
+    monkeypatch.setattr(harbor.settings, "harbor_env", "fake")
+    assert harbor.kill_orphan_compose(job) == 0
+
+
+def test_remove_stale_worktrees(tmp_path, monkeypatch):
+    from app.services import runner
+
+    wt = tmp_path / "worktrees"
+    (wt / "run-15" / "sub").mkdir(parents=True)
+    (wt / "run-15" / "sub" / "f.txt").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(runner.settings, "data_dir", tmp_path)
+    runner.remove_stale_worktrees([wt / "run-15"])
+    assert not (wt / "run-15").exists()
 
 
 def test_auto_detect_source_without_manifest(client, harbor_repo):

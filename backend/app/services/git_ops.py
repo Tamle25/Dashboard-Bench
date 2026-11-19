@@ -237,7 +237,22 @@ def remove_worktree(repo_dir: Path, dest: Path) -> None:
         try:
             _run(["worktree", "remove", "--force", str(dest)], cwd=repo_dir)
         except GitError:
+            pass
+        # `worktree remove` có thể bỏ sót thư mục rỗng mà Docker vừa mount (vd. environment/ của
+        # task bị dừng giữa chừng). Xoá nốt phần còn lại.
+        if dest.exists():
             remove_tree(dest)
+
+
+def prune_worktrees(repo_dir: Path) -> None:
+    """Quên các worktree mà thư mục đã bị xoá (không lỗi nếu repo_dir không phải repo git)."""
+    if not (repo_dir / ".git").exists() and not (repo_dir / "HEAD").is_file():
+        return  # không phải repo: git sẽ leo lên repo cha (vd. chính repo dashboard)
+    with repo_lock(repo_dir):
+        try:
+            _run(["worktree", "prune"], cwd=repo_dir)
+        except GitError:
+            pass
 
 
 def remove_tree(path: Path) -> None:
