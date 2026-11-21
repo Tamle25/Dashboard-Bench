@@ -322,6 +322,8 @@ class RunManager:
         opts = bench.options or {}
         version = await asyncio.to_thread(harbor.preflight)
         self.log(db, run, "INFO", f"Harbor {version} · môi trường {settings.harbor_env}")
+        if settings.apt_mirror.strip():
+            self.log(db, run, "INFO", f"apt trong container dùng mirror {settings.apt_mirror.strip()}")
         if opts.get("prepare"):
             self.log(db, run, "INFO", "Chạy bước prepare: " + " && ".join(opts["prepare"]))
             await asyncio.to_thread(harbor.run_prepare, root, opts["prepare"])

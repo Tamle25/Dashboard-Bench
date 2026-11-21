@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     # image riêng 1–9 GB; giữ lại thì ổ đĩa đầy sau vài chục task. Kết quả và log vẫn giữ nguyên.
     # Tắt (false) nếu muốn chạy lại cùng task nhiều lần mà không phải kéo/build lại image.
     harbor_cleanup_images: bool = True
+    # Mirror Ubuntu thay cho archive/security.ubuntu.com khi agent cài gói hệ thống trong container
+    # (vd. claude-code cần nodejs). Đặt khi đường ra quốc tế chậm, vd. http://mirror.bizflycloud.vn/ubuntu.
+    # Để trống = không đổi. Xem backend/harbor_plugins/bench_apt_mirror.py.
+    apt_mirror: str = ""
     # Thời gian tối đa cho bước "prepare" của manifest (giây).
     prepare_timeout_s: int = 900
 

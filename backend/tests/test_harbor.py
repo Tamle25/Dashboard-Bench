@@ -158,6 +158,30 @@ def test_build_command_for_claude_subscription(monkeypatch):
         harbor.build_command(ep, Path("/t/task"), Path("/jobs"), "job1")
 
 
+def test_build_command_with_apt_mirror(monkeypatch):
+    """BENCH_APT_MIRROR: bọc agent bằng bench_apt_mirror và đưa module vào PYTHONPATH của Harbor."""
+    import os
+
+    monkeypatch.setenv("TOK", "sk-ant-oat-test")
+    monkeypatch.setenv("PYTHONPATH", "X:/old")
+    monkeypatch.setattr(harbor.settings, "apt_mirror", "http://mirror.bizflycloud.vn/ubuntu")
+    ep = ModelEndpoint(id="opus-sub", kind="harbor", agent="claude-code", model_name="anthropic/claude-opus-4-7", secret_name="TOK", auth="oauth")
+    cmd, env = harbor.build_command(ep, Path("/t/task"), Path("/jobs"), "job1")
+    assert cmd[cmd.index("-a") + 1] == "bench_apt_mirror:claude-code"
+    assert env["BENCH_APT_MIRROR"] == "http://mirror.bizflycloud.vn/ubuntu"
+    assert env["PYTHONPATH"].split(os.pathsep) == [str(harbor.PLUGINS_DIR), "X:/old"]
+    assert (harbor.PLUGINS_DIR / "bench_apt_mirror.py").is_file()
+
+    # Agent dạng đường dẫn tuỳ chỉnh: giữ nguyên
+    custom = ModelEndpoint(id="c", kind="harbor", agent="my.mod:Agent")
+    cmd, _ = harbor.build_command(custom, Path("/t/task"), Path("/jobs"), "job1")
+    assert cmd[cmd.index("-a") + 1] == "my.mod:Agent"
+
+    monkeypatch.setattr(harbor.settings, "apt_mirror", "")
+    cmd, env = harbor.build_command(ep, Path("/t/task"), Path("/jobs"), "job1")
+    assert cmd[cmd.index("-a") + 1] == "claude-code" and "BENCH_APT_MIRROR" not in env
+
+
 def test_stop_removes_task_containers(tmp_path, monkeypatch):
     """Agent chạy trong container: dừng Harbor thôi thì agent vẫn chạy tiếp (run-27 tiêu
     thêm ~25 phút hạn mức sau khi đã bấm Dừng). Phải gỡ container theo project compose."""

@@ -252,6 +252,21 @@ def check_agent(name: str) -> None:
 OAUTH_AGENT = "claude-code"
 OAUTH_ENV = "CLAUDE_CODE_OAUTH_TOKEN"
 
+# Module chạy trong Python của Harbor (không phải của backend), nạp qua PYTHONPATH.
+PLUGINS_DIR = Path(__file__).resolve().parents[2] / "harbor_plugins"
+APT_MIRROR_MODULE = "bench_apt_mirror"
+
+
+def _agent_arg(agent: str, env: dict) -> str:
+    """Tên agent truyền cho `harbor run -a`. Khi đặt BENCH_APT_MIRROR thì bọc agent bằng
+    bench_apt_mirror để apt trong container dùng mirror (agent dạng đường dẫn tuỳ chỉnh giữ nguyên)."""
+    mirror = settings.apt_mirror.strip()
+    if not mirror or ":" in agent or "/" in agent or "." in agent:
+        return agent
+    env["BENCH_APT_MIRROR"] = mirror
+    env["PYTHONPATH"] = os.pathsep.join(p for p in (str(PLUGINS_DIR), env.get("PYTHONPATH", "")) if p)
+    return f"{APT_MIRROR_MODULE}:{agent}"
+
 def build_command(ep: ModelEndpoint, task_path: Path, jobs_dir: Path, job_name: str) -> tuple[list[str], dict]:
     cmd = [
         *settings.harbor_cmd, "run",
@@ -264,7 +279,7 @@ def build_command(ep: ModelEndpoint, task_path: Path, jobs_dir: Path, job_name: 
         if not ep.agent:
             raise HarborError(f"{ep.id}: chưa đặt agent Harbor")
         check_agent(ep.agent)
-        cmd += ["-a", ep.agent]
+        cmd += ["-a", _agent_arg(ep.agent, env)]
         if ep.model_name:
             cmd += ["-m", ep.model_name]
         if oauth:
@@ -281,7 +296,7 @@ def build_command(ep: ModelEndpoint, task_path: Path, jobs_dir: Path, job_name: 
             cmd += ["--api-key-name", ep.secret_name]
     elif ep.kind == "openai":
         check_agent(ep.agent or "terminus-2")
-        cmd += ["-a", ep.agent or "terminus-2", "-m", ep.model_name or ep.id, "--base-url", ep.base_url, "--api-format", "openai_chat_completions"]
+        cmd += ["-a", _agent_arg(ep.agent or "terminus-2", env), "-m", ep.model_name or ep.id, "--base-url", ep.base_url, "--api-format", "openai_chat_completions"]
         if ep.secret_name:
             cmd += ["--api-key-name", ep.secret_name]
     else:
